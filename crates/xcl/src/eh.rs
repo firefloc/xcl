@@ -397,6 +397,31 @@ unsafe extern "system" fn cpp_exception_logger(info: *mut EXCEPTION_POINTERS) ->
     if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
         return emulate_console_only(&mut *(*info).ContextRecord);
     }
+    // `XCL_TRACE_FAULTS=1`: access violations as they are raised (the first 32), before the
+    // title's handlers – a title whose own crash filter ends the process leaves no other trace
+    if rec.ExceptionCode as u32 == 0xC000_0005 && rec.NumberParameters >= 2 {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static N: AtomicUsize = AtomicUsize::new(0);
+        if *ON.get_or_init(|| std::env::var_os("XCL_TRACE_FAULTS").is_some()) && N.fetch_add(1, Ordering::Relaxed) < 32 {
+            let c = &*(*info).ContextRecord;
+            let op = match rec.ExceptionInformation[0] {
+                0 => "read",
+                1 => "write",
+                8 => "execute",
+                _ => "?",
+            };
+            crate::xlog_warn!(
+                "access violation ({op} at {:#x}) in {}; rax={:#x} rcx={:#x} rdx={:#x} r8={:#x}; on the stack: {}",
+                rec.ExceptionInformation[1],
+                modules::describe_address(rec.ExceptionAddress as usize),
+                c.Rax,
+                c.Rcx,
+                c.Rdx,
+                c.R8,
+                stack_callers(c.Rsp as usize)
+            );
+        }
+    }
     if rec.ExceptionCode != CPP || rec.NumberParameters < 4 {
         return 0;
     }

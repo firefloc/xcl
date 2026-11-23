@@ -1824,6 +1824,18 @@ QueryPerformanceCounter; `rdpid`: the processor number). Logged once per instruc
 (and `ud2`, a title's own trap) is logged with its 16 code bytes, in the first-chance handler and in the crash line.
 SHA-NI is not emulated (also missing on those CPUs): add it if a title's code bytes show `0F 38 C8..CD`.
 
+- **Then: past the first menu to its settings (2026-11-23)** – pressing A on the account prompt crashed the title
+  a few seconds later (0xC0000005 with no XCL crash line: its own crash filter ends the process). `XCL_TRACE_FAULTS=1`
+  (access violations logged as they are raised, before the title's handlers) showed the title reading slot 25 of a
+  device "vtable" 0x1000. GetResourceAllocationInfo and the other struct-returning device methods take either
+  argument order (return buffer, device / device, return buffer), told apart by which argument looks adopted; the
+  title's stack return buffer held a stale copy of the device's vtable pointer, so the result went over the device
+  object. `real::this_first`: when both look adopted, the one on the thread's stack (or not the device) is the
+  buffer. Menus now ~15 GB committed (#225: exact-size arenas for D32S8 / MSAA).
+- Open (from a user report): a write-watch scan of textures in the 4 GiB coherent window costs in proportion to their
+  size at every submit; a page guard (read-only until the first CPU write, `kernelx::lazy`) was tried and reverted
+  pending measurement past the menus.
+
 ## Next steps (priority)
 Little is left to do without the exe – the rest needs an actual run of the game.
 1. Once the user has a legal game exe: `xcl inspect`, `xcl run`, analysis of `report.json`

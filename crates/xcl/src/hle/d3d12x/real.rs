@@ -636,6 +636,34 @@ pub(super) unsafe fn is_adopted(obj: *mut c_void) -> bool {
     !obj.is_null() && crate::gpu::shader::readable(obj as usize, 8) && is_ext(*(obj as *const usize))
 }
 
+/// A struct-returning method's first two arguments: true when `a` is the object (the C++ way:
+/// this, return buffer, …), false when `b` is (the C way: return buffer, this, …). A return
+/// buffer on the stack can hold a stale copy of an object's vtable pointer and look adopted
+/// itself: a retail game's call of GetResourceAllocationInfo the C way then had its result
+/// written over the device's vtable pointer (the next call read slot 25 of "vtable" 0x1000). So
+/// when both look adopted, the one on this thread's stack – or the one that is not the device –
+/// is the buffer.
+pub(super) unsafe fn this_first(a: *mut c_void, b: *mut c_void) -> bool {
+    match (is_adopted(a), is_adopted(b)) {
+        (true, false) => true,
+        (false, true) => false,
+        (true, true) => {
+            let (mut lo, mut hi) = (0usize, 0usize);
+            windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut lo, &mut hi);
+            let on_stack = |p: *mut c_void| (lo..hi).contains(&(p as usize));
+            let dev = device_raw();
+            if on_stack(a) != on_stack(b) {
+                on_stack(b)
+            } else if a == dev || b == dev {
+                a == dev
+            } else {
+                true
+            }
+        }
+        (false, false) => false,
+    }
+}
+
 fn is_ext(v: usize) -> bool {
     EXTS.lock().map(|g| g.as_ref().map(|s| s.contains(&v)).unwrap_or(false)).unwrap_or(false)
 }
