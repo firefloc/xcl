@@ -539,6 +539,14 @@ pub unsafe fn adopt(obj: *mut c_void, kind: Kind) {
     if obj.is_null() {
         return;
     }
+    if kind == Kind::CommandAllocator && std::env::var("XCL_PROBE_NATIVE_ALLOCATOR").as_deref() == Ok("1") {
+        // shortcut: Reset/Release hooks, recycling and the Xbox slot are absent; restore them after this diagnostic.
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            crate::xlog_info!("D3D12 probe: keeping native command allocator vtable; Reset/Release hooks and recycling disabled");
+        }
+        return;
+    }
     let v = vt(obj) as usize;
     if is_ext(v) {
         return;
