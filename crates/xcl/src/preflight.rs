@@ -53,8 +53,7 @@ pub struct Found {
     pub wine: Option<WineLibs>,
 }
 
-/// What the libraries loaded under Wine are, found by looking into their images. `None`: that
-/// library is not loaded, nothing to say.
+/// What the libraries loaded under Wine are, found by reading their files. `None`: unknown.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WineLibs {
     /// `d3d12core.dll` holds vkd3d-proton's vtable-identity assertions
@@ -116,6 +115,14 @@ pub fn checks(f: &Found) -> Vec<Check> {
                 format!("this vkd3d-proton stops on the objects XCL hands to D3D12 (its d3d12core.dll holds the assertion `{VKD3D_VTABLE_ASSERT}`, upstream issue #241): the game aborts as soon as it uses one of them"),
                 Some("use the vkd3d-proton built by scripts/linux/build-vkd3d-proton.sh (patched, assertions off) – see docs/linux.md"),
             ));
+        }
+        if w.vkd3d_asserts_vtables == Some(false) {
+            v.push(check(Level::Note, "d3d12core.dll does not contain the vkd3d assertion marker: this does not prove the library is patched", None));
+        } else if w.vkd3d_asserts_vtables.is_none() {
+            v.push(check(Level::Warning, "could not inspect the loaded d3d12core.dll for the vkd3d assertion marker", Some("check the vkd3d-proton installation – see docs/linux.md")));
+        }
+        if w.dxgi_is_dxvk.is_none() {
+            v.push(check(Level::Warning, "could not inspect the loaded dxgi.dll for the DXVK marker", Some("check the DXVK installation – see docs/linux.md")));
         }
         if w.dxgi_is_dxvk == Some(false) {
             v.push(check(
@@ -185,35 +192,24 @@ fn xgameruntime_present() -> bool {
     std::path::Path::new(&root).join("System32").join("xgameruntime.dll").is_file()
 }
 
-/// Whether the image of the loaded module `name` holds `needle`; `None` when it is not loaded.
-/// Only committed, readable pages of the module's own allocation are read.
+/// Whether the loaded module's file contains `needle`; `None` if it cannot be inspected.
 fn image_contains(name: &str, needle: &[u8]) -> Option<bool> {
-    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows_sys::Win32::System::Memory::*;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
     let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: `wide` is NUL-terminated; the regions read are the ones VirtualQuery reports as
-    // committed and readable, inside the allocation of the module's base address.
-    unsafe {
-        let base = GetModuleHandleW(wide.as_ptr()) as *const u8;
-        if base.is_null() {
-            return None;
-        }
-        let readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-        let mut at = base;
-        loop {
-            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-            if VirtualQuery(at as _, &mut mbi, std::mem::size_of_val(&mbi)) == 0 || mbi.AllocationBase as *const u8 != base {
-                return Some(false);
-            }
-            if mbi.State == MEM_COMMIT && mbi.Protect & readable != 0 && mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS) == 0 {
-                let region = std::slice::from_raw_parts(mbi.BaseAddress as *const u8, mbi.RegionSize);
-                if region.windows(needle.len()).any(|w| w == needle) {
-                    return Some(true);
-                }
-            }
-            at = (mbi.BaseAddress as *const u8).add(mbi.RegionSize);
-        }
+    // SAFETY: the name is NUL-terminated and the buffer has the advertised capacity.
+    let module = unsafe { GetModuleHandleW(wide.as_ptr()) };
+    if module.is_null() {
+        return None;
     }
+    let mut path = vec![0u16; 32768];
+    let len = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) } as usize;
+    if len == 0 || len >= path.len() {
+        return None;
+    }
+    let path = std::ffi::OsString::from_wide(&path[..len]);
+    let bytes = std::fs::read(path).ok()?;
+    Some(!needle.is_empty() && bytes.windows(needle.len()).any(|w| w == needle))
 }
 
 /// The libraries the process has by now (after the GPU probe has loaded them), under Wine.
@@ -316,6 +312,19 @@ mod tests {
         assert_eq!(levels(&found(Gpu { warp: true, ..gpu() }))[0], Level::Warning);
         let f = Found { gpu: Err("DXGI: E_FAIL".into()), ..found(gpu()) };
         assert_eq!(checks(&f)[0].level, Level::Error);
+    }
+
+    #[test]
+    fn wine_marker_results_are_visible() {
+        let mut f = found(gpu());
+        f.wine = Some(WineLibs { vkd3d_asserts_vtables: Some(false), dxgi_is_dxvk: None });
+        let c = checks(&f);
+        assert!(c.iter().any(|c| c.level == Level::Note && c.what.contains("does not prove")));
+        assert!(c.iter().any(|c| c.level == Level::Warning && c.what.contains("could not inspect the loaded dxgi")));
+        f.wine = Some(WineLibs { vkd3d_asserts_vtables: Some(true), dxgi_is_dxvk: Some(false) });
+        let c = checks(&f);
+        assert!(c.iter().any(|c| c.level == Level::Error && c.what.contains(VKD3D_VTABLE_ASSERT)));
+        assert!(c.iter().any(|c| c.level == Level::Warning && c.what.contains("not DXVK")));
     }
 
     #[test]
