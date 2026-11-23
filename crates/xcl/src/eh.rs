@@ -76,6 +76,9 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             };
             extra = format!(" ({op} at address {:#x})", rec.ExceptionInformation[1]);
         }
+        if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
+            extra = format!(" (code bytes: {})", code_at(addr));
+        }
         let ctx = (*info).ContextRecord;
         let regs = if ctx.is_null() {
             String::new()
@@ -91,7 +94,12 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
                 let d = modules::describe_address(vt);
                 if d.contains('+') { format!(" (vtable {d})") } else { String::new() }
             };
-            let regs = [("rax", c.Rax), ("rbx", c.Rbx), ("rcx", c.Rcx), ("rdx", c.Rdx), ("rsi", c.Rsi), ("rdi", c.Rdi), ("rbp", c.Rbp), ("r8", c.R8), ("r9", c.R9), ("r12", c.R12), ("r13", c.R13), ("r14", c.R14), ("r15", c.R15), ("rsp", c.Rsp)];
+            let regs = [
+                ("rax", c.Rax), ("rbx", c.Rbx), ("rcx", c.Rcx), ("rdx", c.Rdx),
+                ("rsi", c.Rsi), ("rdi", c.Rdi), ("rbp", c.Rbp), ("r8", c.R8),
+                ("r9", c.R9), ("r10", c.R10), ("r11", c.R11), ("r12", c.R12),
+                ("r13", c.R13), ("r14", c.R14), ("r15", c.R15), ("rsp", c.Rsp),
+            ];
             let callers = stack_callers(c.Rsp as usize);
             regs.iter().map(|(n, v)| format!(" {n}={v:#x}{}", obj(*v))).collect::<String>() + &if callers.is_empty() { String::new() } else { format!("; on the stack: {callers}") }
         };
@@ -237,6 +245,136 @@ unsafe fn bounded_cstr(p: usize, max: usize) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+fn is_writable(va: usize, bytes: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_READWRITE};
+    let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let found = unsafe { VirtualQuery(va as *const std::ffi::c_void, &mut m, std::mem::size_of_val(&m)) } != 0;
+    found
+        && m.State == MEM_COMMIT
+        && m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
+        && m.BaseAddress as usize + m.RegionSize >= va + bytes
+}
+
+const ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+
+/// The first 16 code bytes at `rip`, as hex (as far as they are readable).
+unsafe fn code_at(rip: usize) -> String {
+    let n = (1..=16).rev().find(|&n| crate::gpu::shader::readable(rip, n)).unwrap_or(0);
+    crate::insn::hex(std::slice::from_raw_parts(rip as *const u8, n))
+}
+
+/// A title's STATUS_ILLEGAL_INSTRUCTION: an instruction the console's Zen 2 has and this CPU
+/// lacks (`insn`) is emulated and stepped over (EXCEPTION_CONTINUE_EXECUTION); anything else is
+/// logged with its code bytes and goes on to the title's handlers.
+unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) -> i32 {
+    use crate::insn::ConsoleOnly;
+    let rip = ctx.Rip as usize;
+    if modules::image_base_for_addr(rip).is_none() || !crate::gpu::shader::readable(rip, 1) {
+        return 0;
+    }
+    let n = (1..=16).rev().find(|&n| crate::gpu::shader::readable(rip, n)).unwrap_or(0);
+    let code = std::slice::from_raw_parts(rip as *const u8, n);
+    let Some((what, len)) = crate::insn::decode(code) else {
+        crate::xlog_error!("illegal instruction in {}: code bytes {}", modules::describe_address(rip), crate::insn::hex(code));
+        return 0;
+    };
+    static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
+    if let Ok(mut seen) = SEEN.lock() {
+        if !seen.contains(&std::mem::discriminant(&what)) {
+            seen.push(std::mem::discriminant(&what));
+            if what == ConsoleOnly::Ud2 {
+                crate::xlog_error!("ud2 in {} – the title's own trap; on the stack: {}", modules::describe_address(rip), stack_callers(ctx.Rsp as usize));
+            } else {
+                crate::xlog_warn!("{what:?} in {} – a console CPU instruction this CPU lacks: emulated (logged once)", modules::describe_address(rip));
+            }
+        }
+    }
+    match what {
+        ConsoleOnly::Ud2 => return 0,
+        ConsoleOnly::Clwb => {
+            use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+            let mut old = 0u32;
+            if unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, PAGE_EXECUTE_READWRITE, &mut old) } != 0 {
+                let code = unsafe { std::slice::from_raw_parts_mut(rip as *mut u8, len) };
+                code.fill(0x90);
+                unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, old, &mut old) };
+            }
+        }
+        ConsoleOnly::Monitorx => {}
+        ConsoleOnly::Mwaitx => {
+            std::hint::spin_loop();
+        }
+        ConsoleOnly::Clzero => {
+            // with an address-size prefix (0x67, among the prefixes before 0F 01 FC) the line
+            // is at EAX, zero-extended – as a Zen 5 runs it
+            let a32 = code[..len - 3].contains(&0x67);
+            let line = (if a32 { ctx.Rax & 0xFFFF_FFFF } else { ctx.Rax } as usize) & !63;
+            if is_writable(line, 64) {
+                std::ptr::write_bytes(line as *mut u8, 0, 64);
+            } else {
+                return 0; // the real instruction faults there too
+            }
+        }
+        ConsoleOnly::ClzeroLoop { end_reg } => {
+            let regs: [&u64; 16] = [
+                &ctx.Rax, &ctx.Rcx, &ctx.Rdx, &ctx.Rbx, &ctx.Rsp, &ctx.Rbp, &ctx.Rsi, &ctx.Rdi,
+                &ctx.R8, &ctx.R9, &ctx.R10, &ctx.R11, &ctx.R12, &ctx.R13, &ctx.R14, &ctx.R15,
+            ];
+            let end = *regs[end_reg as usize & 15] as usize;
+            let start = ctx.Rax as usize;
+            if end > start && (end - start) < 2 * 1024 * 1024 * 1024 {
+                let bytes = end - start;
+                if is_writable(start, bytes) {
+                    std::ptr::write_bytes(start as *mut u8, 0, bytes);
+                } else {
+                    return 0;
+                }
+            }
+            ctx.Rax = end as u64;
+        }
+        ConsoleOnly::Rdpru => {
+            let mut v = 0i64;
+            windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut v);
+            let v = if ctx.Rcx as u32 <= 1 { v as u64 } else { 0 };
+            ctx.Rax = v & 0xFFFF_FFFF;
+            ctx.Rdx = v >> 32;
+        }
+        ConsoleOnly::Rdpid(r) => {
+            let cpu = windows_sys::Win32::System::Threading::GetCurrentProcessorNumber() as u64;
+            let regs: [&mut u64; 16] = [
+                &mut ctx.Rax, &mut ctx.Rcx, &mut ctx.Rdx, &mut ctx.Rbx, &mut ctx.Rsp, &mut ctx.Rbp, &mut ctx.Rsi, &mut ctx.Rdi,
+                &mut ctx.R8, &mut ctx.R9, &mut ctx.R10, &mut ctx.R11, &mut ctx.R12, &mut ctx.R13, &mut ctx.R14, &mut ctx.R15,
+            ];
+            *regs[r as usize & 15] = cpu;
+        }
+        // the low quadword changes; the high one, undefined in AMD's manual, is zeroed – what a
+        // Zen 5 does in all of 32 779 cases compared (Kalmarv on #209)
+        ConsoleOnly::Extrq { dst, src, len, idx } => {
+            let x = &mut ctx.Anonymous.FltSave.XmmRegisters;
+            let (len, idx) = match src {
+                Some(s) => {
+                    let c = x[s as usize & 15].Low;
+                    (c as u8, (c >> 8) as u8)
+                }
+                None => (len, idx),
+            };
+            let d = &mut x[dst as usize & 15];
+            d.Low = crate::insn::extrq(d.Low, len, idx);
+            d.High = 0;
+        }
+        ConsoleOnly::Insertq { dst, src, reg, len, idx } => {
+            let x = &mut ctx.Anonymous.FltSave.XmmRegisters;
+            let s = x[src as usize & 15];
+            let (len, idx) = if reg { (s.High as u8, (s.High >> 8) as u8) } else { (len, idx) };
+            let d = &mut x[dst as usize & 15];
+            d.Low = crate::insn::insertq(d.Low, s.Low, len, idx);
+            d.High = 0;
+        }
+    }
+    ctx.Rip += len as u64;
+    -1 // EXCEPTION_CONTINUE_EXECUTION
+}
+
 unsafe extern "system" fn cpp_exception_logger(info: *mut EXCEPTION_POINTERS) -> i32 {
     const CPP: i32 = 0xE06D_7363_u32 as i32;
     const THREAD_NAME: i32 = 0x406D_1388;
@@ -255,6 +393,9 @@ unsafe extern "system" fn cpp_exception_logger(info: *mut EXCEPTION_POINTERS) ->
             }
         }
         return 0;
+    }
+    if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
+        return emulate_console_only(&mut *(*info).ContextRecord);
     }
     if rec.ExceptionCode != CPP || rec.NumberParameters < 4 {
         return 0;
@@ -771,5 +912,38 @@ mod tests {
         let console: Vec<u8> = [0xCC, 0x48, 0x3B, 0x0D, 0x99, 0x7E, 0x54, 0x00, 0xF2, 0x75, 0x12, 0x48, 0xC1, 0xC1, 0x10, 0x66, 0xF7, 0xC1, 0xFF, 0xFF, 0xF2, 0x75, 0x02, 0xF2, 0xC3, 0x48, 0xC1, 0xC9, 0x10, 0xE9, 0x4F, 0x06, 0, 0, 0xCC].to_vec();
         assert_eq!(find_gs_check(&console), Some(29));
         assert_eq!(find_gs_check(&[0x48; 64]), None);
+    }
+
+    /// `67 0F 01 FC`: CLZERO at EAX. rax's upper half set, and memory mapped at both the 64- and
+    /// the 32-bit address: only the 32-bit one's line is zeroed.
+    #[test]
+    fn clzero_with_an_address_size_prefix_zeroes_at_eax() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+        let alloc = |at: usize| unsafe { VirtualAlloc(at as *const _, 0x1_0000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize };
+        let low = (1..64).map(|n| alloc(n << 26)).find(|&p| p != 0).expect("a buffer below 4 GiB");
+        let high = (1..256).map(|n| alloc(low + (n << 32))).find(|&p| p != 0).expect("a buffer at low + n << 32");
+        let code = alloc(0);
+        modules::register_mapped(Arc::new(modules::MappedModule {
+            name: "clzero_a32.exe".into(), path: "clzero_a32.exe".into(), base: code, size: 0x1_0000, entry_rva: 0, is_dll: false,
+            exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true), stack_reserve: 0,
+        }));
+        // alone, and as the first of a loop to rdx (add rax, 0x40; cmp rax, rdx; jb back to the 0F)
+        for bytes in [&[0x67u8, 0x0F, 0x01, 0xFC][..], &[0x67, 0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4]] {
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), code as *mut u8, bytes.len());
+                std::ptr::write_bytes(low as *mut u8, 0xA5, 0x100);
+                std::ptr::write_bytes(high as *mut u8, 0xA5, 0x100);
+                let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+                (ctx.Rip, ctx.Rax, ctx.Rdx) = (code as u64, (high + 0x47) as u64, (high + 0x100) as u64);
+                assert_eq!(emulate_console_only(&mut ctx), -1);
+                assert_eq!(ctx.Rip, code as u64 + 4);
+                let (l, h) = (std::slice::from_raw_parts(low as *const u8, 0x100), std::slice::from_raw_parts(high as *const u8, 0x100));
+                assert!(l[0x40..0x80].iter().all(|&b| b == 0) && l[..0x40].iter().chain(&l[0x80..]).all(|&b| b == 0xA5), "the line at EAX");
+                assert!(h.iter().all(|&b| b == 0xA5), "nothing at RAX");
+            }
+        }
+        modules::unregister_mapped(code);
     }
 }

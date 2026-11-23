@@ -33,6 +33,7 @@ use crate::util::{HRESULT, S_OK};
 const E_NOTIMPL: HRESULT = 0x8000_4001u32 as i32;
 const E_POINTER: HRESULT = 0x8000_4003u32 as i32;
 const E_INVALIDARG: HRESULT = 0x8007_0057u32 as i32;
+const E_FAIL: HRESULT = 0x8000_4005u32 as i32;
 
 pub const LAYOUT_BYTES: usize = 0x1B40;
 const PLANE: usize = 0x18;
@@ -110,12 +111,13 @@ pub struct Texture {
 }
 
 /// (log2 bytes per element, pixels per element side) of a DXGI format; None for the 96-bit
-/// and packed 4:2:2 ones (not tiled) and unknown formats
+/// and packed 4:2:2 ones (not tiled) and unknown formats. The console's own 116 / 117
+/// (R10G10B10_7E3_A2_FLOAT / _6E4_A2_FLOAT) are 32 bits a pixel, like R10G10B10A2.
 pub fn element(f: u32) -> Option<(u32, u32)> {
     Some(match f {
         1..=4 => (4, 1),
         9..=22 => (3, 1),
-        23..=47 | 67 | 87..=93 => (2, 1),
+        23..=47 | 67 | 87..=93 | 116 | 117 => (2, 1),
         48..=59 | 85 | 86 | 115 => (1, 1),
         60..=65 => (0, 1),
         70..=72 | 79..=81 => (3, 4),
@@ -156,8 +158,13 @@ impl Texture {
             return Err(E_INVALIDARG);
         }
         // depth + stencil formats: a 4-byte depth plane and a 1-byte stencil plane
-        let planar = matches!(format, 19..=22 | 44..=47);
-        let (e, side) = if planar { (2, 1) } else { element(format).ok_or(E_INVALIDARG)? };
+        // depth + stencil formats: a 4-byte depth plane (the console's D16_UNORM_S8_UINT family,
+        // 118 – 120: a 2-byte one) and a 1-byte stencil plane
+        // (its R16_UNORM_X8_TYPELESS view format, 119, the library lays out as a plain 2-byte
+        // colour format – and as the depth + stencil pair for a depth buffer)
+        let d16s8 = matches!(format, 118 | 120) || (format == 119 && flags & 3 == 2 && mips == 1);
+        let planar = matches!(format, 19..=22 | 44..=47) || d16s8;
+        let (e, side) = if d16s8 || format == 119 { (1, 1) } else if planar { (2, 1) } else { element(format).ok_or(E_INVALIDARG)? };
         let mode = match layout {
             1 => 0,
             0 if line => 0, // a 1D texture is linear
@@ -173,7 +180,7 @@ impl Texture {
         }
         let surface = |e: u32, side: u32| Surface::new(mode, e, side, width as u32, height, array, mips, pipes);
         let (rt, ds) = (flags & 1 != 0, flags & 2 != 0);
-        if planar && layout == 2 {
+        if planar && layout == 2 && format != 119 {
             return Err(E_INVALIDARG); // a stencil format with the 64KB_D choice
         }
         // a depth buffer (one level: it gets an HTILE) is in the Z modes; in a color format it
@@ -188,7 +195,10 @@ impl Texture {
         let blank = (depth_buffer && !depth_format) || ((rt || ds) && side > 1 && mips == 1);
         // and then the resource is empty – except a render target's CMASK
         let empty = blank && ds;
-        let main = if blank { PlaneKind::Blank } else { PlaneKind::Surface(surface(e, side)?) };
+        // the stencil view format of D16S8 (120): its depth plane takes no room, but in a
+        // one-level depth buffer
+        let stencil_only = format == 120 && !depth_buffer;
+        let main = if blank || stencil_only { PlaneKind::Blank } else { PlaneKind::Surface(surface(e, side)?) };
         let stencil = if planar { Some(surface(0, 1)?) } else { None };
         // metadata planes, per slice: CMASK 1 byte per 128 pixels, HTILE per 16, of the size
         // padded to 1024 × 1024
@@ -484,6 +494,7 @@ fn vtbl() -> &'static [usize] {
             not_implemented as usize,
             copy_into as usize,
             copy_from as usize,
+            get_resource_tiling as usize,
         ];
         for i in v.len()..12 {
             let (stub, _) = crate::stubs::make_stub_info("xg_xs.dll", &format!("XGTextureAddressComputer::#{i}"), E_NOTIMPL as u32 as u64);
@@ -596,6 +607,62 @@ unsafe extern "system" fn not_implemented(_p: *mut c_void) -> HRESULT {
     E_NOTIMPL
 }
 
+/// #10 GetResourceTiling(&tiles, &packed mip info, &tile shape, &count, first subresource,
+/// tilings) – D3D12's, for the texture's 64 KiB tiles (as the console's library answers: other
+/// swizzle modes E_FAIL; the mip tail is tile 0 of a slice; `count` comes back as the standard
+/// – not packed – subresources among the asked ones, written at their index from `first`, the
+/// packed ones left as they were). Volumes: not modelled (E_NOTIMPL).
+unsafe extern "system" fn get_resource_tiling(p: *mut c_void, tiles: *mut u32, packed: *mut [u32; 3], shape: *mut [u32; 3], count: *mut u32, first: u32, out: *mut [u32; 3]) -> HRESULT {
+    let Some(s) = tex(p).texels() else { return E_FAIL };
+    if s.depth > 0 {
+        return E_NOTIMPL;
+    }
+    let l = &s.chain.layout;
+    if l.block_bytes != TILE_BYTES {
+        return E_FAIL;
+    }
+    let tile = TILE_BYTES as u64;
+    let mips = s.chain.levels.len();
+    let std_mips = s.first_tail.min(mips);
+    if !tiles.is_null() {
+        *tiles = s.size().div_ceil(tile) as u32;
+    }
+    if !packed.is_null() {
+        let n_packed = (mips - std_mips) as u32;
+        let tail_tiles = if n_packed > 0 { 1 } else { 0 };
+        *packed = [std_mips as u32 | n_packed << 8, tail_tiles, 0];
+    }
+    if !shape.is_null() {
+        *shape = [(l.block_w as u32) * s.side, (l.block_h as u32) * s.side, l.block_d as u32];
+    }
+    if !count.is_null() {
+        let asked = *count as usize;
+        let subs = mips * s.array as usize;
+        let mut written = 0u32;
+        for k in 0..asked {
+            let sub = first as usize + k;
+            if sub >= subs {
+                break;
+            }
+            let (i, slice) = (sub % mips, sub / mips);
+            if i >= std_mips {
+                continue;
+            }
+            written += 1;
+            if !out.is_null() {
+                let (pw, ph) = s.padded(i);
+                let start = (slice as u64 * s.chain.slice_bytes as u64 + s.mip_offset(i)) / tile;
+                *out.add(k) = [pw.div_ceil(l.block_w) as u32, ph.div_ceil(l.block_h) as u32 | 1 << 16, start as u32];
+            }
+        }
+        *count = written;
+    }
+    S_OK
+}
+
+/// bytes of a tiled resource's tile
+const TILE_BYTES: usize = 0x1_0000;
+
 /// (surface, its offset, level, slice) of a subresource (mip + slice × mips) of a plane
 fn subresource(t: &Texture, plane: u32, sub: u32) -> Option<(&Surface, u64, usize, usize)> {
     let (s, at) = t.plane_surface(plane)?;
@@ -679,5 +746,41 @@ mod tests {
         assert_eq!(offsets, [0x20000, 0x10000, 0x8000, 0x4000, 0x2000, 0x1000, 0x800, 0x600, 0x500]);
         assert_eq!((mip(2, 0), mip(2, 9), mip(2, 10), mip(2, 18), mip(6, 9), mip(6, 10)), (0x8000, 0x40, 0x80, 1, 8, 8));
         assert_eq!(optimal_mode(0, 0, 32, 256, 256), 5);
+    }
+
+    fn usages_and_bytes(t: &Texture) -> Vec<(u32, u32)> {
+        t.planes.iter().map(|p| (p.usage, if let PlaneKind::Surface(s) = &p.kind { s.bpe } else { 0 })).collect()
+    }
+
+    /// The console's D16_UNORM_S8_UINT (118): a 2-byte depth plane and a 1-byte stencil plane,
+    /// after the HTILE in a depth buffer – a real size, which the PC's allocation info had not
+    /// (u64::MAX, and the title stopped on its assertion).
+    #[test]
+    fn d16s8_is_planar_depth_and_stencil() {
+        let mut x = desc(1920, 1080, 1, 1, 118, 0);
+        x[0x30..0x34].copy_from_slice(&2u32.to_le_bytes()); // ALLOW_DEPTH_STENCIL
+        let t = Texture::new(&x).unwrap();
+        assert_eq!(usages_and_bytes(&t), [(4, 0), (7, 2), (8, 1)]);
+        let end = t.planes.iter().map(|p| p.offset + p.bytes()).max().unwrap();
+        assert!(t.planes.windows(2).all(|w| w[0].offset + w[0].bytes() <= w[1].offset));
+        assert_eq!(t.size(), end);
+        assert!(t.size() >= 1920 * 1080 * 3 && t.size() < 1920 * 1080 * 8, "{:#x}", t.size());
+        assert_eq!(t.alignment(), 0x1_0000);
+        // the same format, not a depth buffer: depth and stencil planes only
+        let t = Texture::new(&desc(512, 512, 1, 1, 118, 0)).unwrap();
+        assert_eq!(usages_and_bytes(&t), [(5, 2), (6, 1)]);
+        assert!(t.size() >= 512 * 512 * 3 && t.size() != u64::MAX);
+    }
+
+    /// The console's R10G10B10_7E3_A2_FLOAT / _6E4_A2_FLOAT (116 / 117): 32 bits a pixel, laid
+    /// out as R10G10B10A2 (24).
+    #[test]
+    fn console_floats_are_32_bits() {
+        let rgb10a2 = Texture::new(&desc(1920, 1080, 1, 1, 24, 0)).unwrap();
+        for f in [116, 117] {
+            let t = Texture::new(&desc(1920, 1080, 1, 1, f, 0)).unwrap();
+            assert_eq!(usages_and_bytes(&t), [(1, 4)]);
+            assert_eq!((t.size(), t.alignment()), (rgb10a2.size(), rgb10a2.alignment()));
+        }
     }
 }

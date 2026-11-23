@@ -14,6 +14,11 @@
 //! The copy waits for the GPU on an XCL queue of the device. Memory that is not readable
 //! (reserved, not mapped yet) reads as zero. GPU writes into the title's memory (copies to the
 //! address) are not seen; the title's own GPU work on the texture goes to the PC texture.
+//!
+//! A copy starts and ends in the state the title's submitted work left the texture in: its
+//! transitions of these textures are noted per PC command list as they are recorded
+//! (`note_transitions`) and applied, in submission order, when the list is submitted
+//! (`submitted`) – per subresource once a transition names one.
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -33,15 +38,17 @@ extern "system" {
     fn GetWriteWatch(flags: u32, base: *const c_void, size: usize, addresses: *mut *mut c_void, count: *mut usize, granularity: *mut u32) -> u32;
 }
 
-/// (device, address, layout, state) of an upload
-type Upload = (usize, usize, Arc<xg::Texture>, D3D12_RESOURCE_STATES);
+/// (device, address, layout, states) of an upload
+type Upload = (usize, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>);
 
 struct Entry {
     device: usize,
     va: usize,
     tex: Arc<xg::Texture>,
-    /// the state the texture was created in (uploads leave it there)
-    state: D3D12_RESOURCE_STATES,
+    /// the state the title's submitted work leaves the texture in (uploads leave it there):
+    /// the creation state, then what its transitions give – one state for every subresource,
+    /// or one per subresource (D3D12 order) while they differ
+    states: Vec<D3D12_RESOURCE_STATES>,
     /// not uploaded yet (made since the last submit)
     pending: bool,
     /// the title's GPU work wrote it (CopyTextureRegion into it): its CPU view is stale from
@@ -76,14 +83,40 @@ pub fn counts() -> (usize, u64) {
 /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
 pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
     let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
-    // render targets and depth buffers are the GPU's (their metadata planes, empty planes)
-    if tex.planes.len() != 1 || tex.texels().is_none() {
+    // the console's 32-bit 116 / 117 floats are half floats on the PC (`pc_resource_desc`): the
+    // title's bytes are not the resource's texels
+    if matches!(u32::from_le_bytes(desc[0x20..0x24].try_into().unwrap()), 116 | 117) {
+        return Err("a console float format the PC holds as R16G16B16A16_FLOAT".into());
+    }
+    // Render targets and depth buffers are the GPU's (their metadata planes, empty planes) –
+    // except a small single-sample colour target with texels: a retail title makes its glyph
+    // caches that way (256x256 R8 with ALLOW_RENDER_TARGET, two planes) and fills them from the
+    // CPU. Left to the GPU they stayed as they were made and its menus' body text lost most of
+    // its letters. Such a target is uploaded like any texture when the CPU wrote its pages; one
+    // the title only renders to is not CPU-written and so not uploaded over.
+    // `XCL_SYNC_SMALL_TARGETS=0` turns this off.
+    let small_target = {
+        let (w, h) = (u64::from_le_bytes(desc[0x10..0x18].try_into().unwrap()), u32::from_le_bytes(desc[0x18..0x1c].try_into().unwrap()));
+        let (samples, flags) = (u32::from_le_bytes(desc[0x24..0x28].try_into().unwrap()), u32::from_le_bytes(desc[0x30..0x34].try_into().unwrap()));
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off = *OFF.get_or_init(|| std::env::var("XCL_SYNC_SMALL_TARGETS").is_ok_and(|v| v.trim() == "0"));
+        // (64x64 and up: 1x1 placeholders are not worth an entry; 0x2: a depth buffer)
+        !off && w <= 1024 && h <= 1024 && w * h as u64 >= 64 * 64 && samples <= 1 && flags & 0x2 == 0
+    };
+    if tex.texels().is_none() || (tex.planes.len() != 1 && !small_target) {
         return Err("a render target / depth buffer".into());
+    }
+    if tex.planes.len() != 1 {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 2 || n.is_power_of_two() {
+            crate::xlog_info!("D3D12.X: a small render target at {va:#x} ({} planes) is kept in step with the title's memory – a glyph cache the CPU fills ({n} so far)", tex.planes.len());
+        }
     }
     if ID3D12Resource::from_raw_borrowed(&res).is_none() {
         return Err("no resource".into());
     }
-    let e = Entry { device: device as usize, va, tex: Arc::new(tex), state, pending: true, gpu_written: false };
+    let e = Entry { device: device as usize, va, tex: Arc::new(tex), states: vec![state], pending: true, gpu_written: false };
     {
         let mut t = TEXTURES.lock().unwrap();
         if let Some(old) = t.insert(res as usize, e) {
@@ -139,6 +172,89 @@ pub fn forget(res: usize) {
 /// The title-memory address of a texture kept in step with it.
 pub fn address(res: usize) -> Option<usize> {
     TEXTURES.lock().unwrap().get(&res).map(|e| e.va)
+}
+
+/// (texture, subresource or ALL_SUBRESOURCES, state after) of a transition the title recorded
+type Transition = (usize, u32, D3D12_RESOURCE_STATES);
+
+/// PC command list → the transitions of textures kept in step it recorded since it was made or
+/// last reset, in order. They apply when the list is submitted – each time: a closed list may
+/// run again.
+static LIST_NOTES: Mutex<BTreeMap<usize, Vec<Transition>>> = Mutex::new(BTreeMap::new());
+
+/// Whether any texture is kept in step (callers skip collecting transitions otherwise).
+pub fn any() -> bool {
+    TEXTURES_LEN.load(Ordering::Relaxed) != 0
+}
+
+/// The title recorded `transitions` on PC list `list`: those of textures kept in step are noted
+/// for when the list is submitted.
+pub fn note_transitions(list: usize, transitions: &[Transition]) {
+    if !any() || transitions.is_empty() {
+        return;
+    }
+    let kept: Vec<Transition> = {
+        let t = TEXTURES.lock().unwrap();
+        transitions.iter().filter(|(r, _, _)| t.contains_key(r)).copied().collect()
+    };
+    if !kept.is_empty() {
+        LIST_NOTES.lock().unwrap().entry(list).or_default().extend(kept);
+    }
+}
+
+/// PC list `list` starts a new recording (made, reset, released): its noted transitions go.
+pub fn list_reset(list: usize) {
+    let mut g = LIST_NOTES.lock().unwrap();
+    if !g.is_empty() {
+        g.remove(&list);
+    }
+}
+
+/// The PC lists `lists` were submitted, in this order: the textures kept in step are in the
+/// states their transitions leave them in.
+pub fn submitted(lists: &[*mut c_void]) {
+    let notes: Vec<Transition> = {
+        let g = LIST_NOTES.lock().unwrap();
+        if g.is_empty() {
+            return;
+        }
+        lists.iter().filter_map(|&l| g.get(&(l as usize))).flatten().copied().collect()
+    };
+    if notes.is_empty() {
+        return;
+    }
+    let mut t = TEXTURES.lock().unwrap();
+    for (res, sub, after) in notes {
+        if let Some(e) = t.get_mut(&res) {
+            let n = subresource_count(&e.tex);
+            apply_transition(&mut e.states, n, sub, after);
+        }
+    }
+}
+
+/// Subresources of a texture kept in step (as `subresources` makes them).
+fn subresource_count(tex: &xg::Texture) -> usize {
+    tex.texels().map_or(1, |s| s.array as usize * s.chain.levels.len())
+}
+
+/// `states` (one for all `n` subresources, or one each) after a transition of subresource `sub`
+/// (or all of them) to `after`; a subresource the texture does not have is ignored.
+fn apply_transition(states: &mut Vec<D3D12_RESOURCE_STATES>, n: usize, sub: u32, after: D3D12_RESOURCE_STATES) {
+    if sub == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES || (n <= 1 && sub == 0) {
+        *states = vec![after];
+        return;
+    }
+    let k = sub as usize;
+    if k >= n {
+        return;
+    }
+    if states.len() != n {
+        *states = vec![states[0]; n];
+    }
+    states[k] = after;
+    if states.iter().all(|&s| s == after) {
+        states.truncate(1);
+    }
 }
 
 thread_local! {
@@ -268,6 +384,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
         DIRTY_BUF.with(|dcell| {
             let dirty = dcell.borrow();
             super::sparse::before_execute(q, &dirty, page as usize);
+            super::vram::before_execute(q);
         });
     }
     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
@@ -295,7 +412,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
                     PENDING.fetch_sub(1, Ordering::Relaxed);
                 }
                 let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.va, Arc::clone(&e.tex), e.state)))
+                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.va, Arc::clone(&e.tex), e.states.clone())))
             })
             .collect()
     });
@@ -322,14 +439,14 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             if !batch.is_empty() && (bytes + tex.size() as usize > BATCH_BYTES || *dev != device) {
                 break;
             }
-            let (r, (dev, va, tex, state)) = todo.next().unwrap();
+            let (r, (dev, va, tex, states)) = todo.next().unwrap();
             device = dev;
             bytes += tex.size() as usize;
             let subs = subresources(va, &tex);
             if super::present::trace_frame() {
                 note_content(va, &r, &subs);
             }
-            batch.push((r, subs, state, state));
+            batch.push((r, subs, states));
         }
         let d = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
@@ -505,6 +622,12 @@ fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> 
 unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let mut out = vec![0u8; len];
+    // (the coherent window is committed as a whole: no `VirtualQuery`, which sizes a region by
+    // walking it)
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
+        std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
+        return out;
+    }
     let mut p = at;
     while p < at + len {
         let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
@@ -544,6 +667,80 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SRV: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0);
+    const ALL: u32 = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+    /// One state while every subresource has it, one each while they differ.
+    #[test]
+    fn transitions_per_subresource_and_back_to_one_state() {
+        let mut s = vec![D3D12_RESOURCE_STATE_COMMON];
+        apply_transition(&mut s, 4, ALL, SRV);
+        assert_eq!(s, vec![SRV]);
+        apply_transition(&mut s, 4, 2, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        assert_eq!(s, vec![SRV, SRV, D3D12_RESOURCE_STATE_COPY_SOURCE, SRV]);
+        apply_transition(&mut s, 4, 9, D3D12_RESOURCE_STATE_COPY_DEST); // no subresource 9
+        assert_eq!(s, vec![SRV, SRV, D3D12_RESOURCE_STATE_COPY_SOURCE, SRV]);
+        apply_transition(&mut s, 4, 2, SRV);
+        assert_eq!(s, vec![SRV]);
+        apply_transition(&mut s, 4, 1, D3D12_RESOURCE_STATE_COPY_DEST);
+        apply_transition(&mut s, 4, ALL, D3D12_RESOURCE_STATE_COMMON);
+        assert_eq!(s, vec![D3D12_RESOURCE_STATE_COMMON]);
+        // a texture of one subresource: subresource 0 is all of it
+        let mut one = vec![SRV];
+        apply_transition(&mut one, 1, 0, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        assert_eq!(one, vec![D3D12_RESOURCE_STATE_COPY_SOURCE]);
+    }
+
+    /// A texture kept in step: the title's transitions count once their list is submitted, in
+    /// submission order, each time it is; a Reset forgets them; other resources are not noted.
+    #[test]
+    fn transitions_apply_when_their_list_is_submitted() {
+        // RGBA8 64×64, 3 mips, 2 slices (6 subresources), 4KB_S
+        let mut d = [0u8; 0x38];
+        d[0..4].copy_from_slice(&3u32.to_le_bytes());
+        d[0x10..0x18].copy_from_slice(&64u64.to_le_bytes());
+        d[0x18..0x1C].copy_from_slice(&64u32.to_le_bytes());
+        d[0x1C..0x1E].copy_from_slice(&2u16.to_le_bytes());
+        d[0x1E..0x20].copy_from_slice(&3u16.to_le_bytes());
+        d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
+        d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+        d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
+        let tex = Arc::new(xg::Texture::new(&d).unwrap());
+        assert_eq!(subresource_count(&tex), 6);
+        // fake resource / list keys, never dereferenced: GPU-written, so no refresh uploads it
+        let (res, other, l1, l2) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize, 0x7E57_0000_3000usize, 0x7E57_0000_4000usize);
+        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true });
+        TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
+        let states = || TEXTURES.lock().unwrap().get(&res).unwrap().states.clone();
+        let (p1, p2) = (l1 as *mut c_void, l2 as *mut c_void);
+
+        note_transitions(l1, &[(res, ALL, SRV), (other, ALL, D3D12_RESOURCE_STATE_RENDER_TARGET), (res, 4, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        assert_eq!(LIST_NOTES.lock().unwrap().get(&l1).map(|v| v.len()), Some(2), "only the texture kept in step is noted");
+        assert_eq!(states(), vec![D3D12_RESOURCE_STATE_COMMON], "recorded, not run yet");
+        note_transitions(l2, &[(res, 4, SRV), (res, 0, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        submitted(&[p1]);
+        let mut want = vec![SRV; 6];
+        want[4] = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        assert_eq!(states(), want);
+        submitted(&[p2]);
+        want[4] = SRV;
+        want[0] = D3D12_RESOURCE_STATE_COPY_DEST;
+        assert_eq!(states(), want);
+        // l1 runs again (a closed list may): its transitions again, after l2's
+        submitted(&[p2, p1]);
+        assert_eq!(states(), {
+            let mut w = vec![SRV; 6];
+            w[4] = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            w
+        });
+        list_reset(l1);
+        list_reset(l2);
+        submitted(&[p1, p2]);
+        assert_eq!(states()[4], D3D12_RESOURCE_STATE_COPY_SOURCE, "a reset list has nothing to apply");
+        forget(res);
+        assert!(LIST_NOTES.lock().unwrap().get(&l1).is_none());
+    }
 
     /// Only the wanted parts of the watched regions are scanned, merged, one region each.
     #[test]

@@ -453,6 +453,10 @@ fn summarize(boot: &Boot, code: u32, environment: &[crate::preflight::Check]) {
     if let Some(r) = report.as_mut() {
         r.exit_code = Some(code as i64);
         r.environment = environment.to_vec();
+        if r.dxc.dir.is_empty() {
+            // the game compiled nothing: the DXC the checks above found for it
+            r.dxc = crate::gpu::recomp::dxc::toolchain();
+        }
         let _ = std::fs::write(&path, serde_json::to_string_pretty(r).unwrap_or_default());
     }
     println!();
