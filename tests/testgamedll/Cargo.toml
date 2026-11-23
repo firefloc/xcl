@@ -10,3 +10,6 @@ publish = false
 name = "testgame_mw"
 crate-type = ["cdylib"]
 path = "src/lib.rs"
+# no tests: its test binary would import kernelx.dll (exit code 53 on the GNU target under Wine)
+test = false
+doctest = false
